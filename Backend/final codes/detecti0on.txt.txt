@@ -1,0 +1,96 @@
+import Detection from '../models/detection.model.js';
+import Lab from '../models/Lab.model.js';
+import LabSession from '../models/LabSession.model.js';
+import path from 'path';
+import fs from 'fs';
+import { sendCmd } from '../utils/scheduler.js';
+
+
+async function runDetectionForLab(labId, sessionId) {
+  console.log('>>> runDetectionForLab called');
+  console.log('LabId:', labId, 'SessionId:', sessionId);
+
+  const lab = await Lab.findById(labId);
+  if (!lab) {
+    console.error(`Lab ${labId} not found`);
+    return;
+  }
+
+  // For debugging: skip time constraints to see if detection is inserted
+  const activeSession = await LabSession.findById(sessionId);
+  if (!activeSession) {
+    console.error(`❌ Session ${sessionId} not found`);
+    return;
+  }
+
+  console.log(`✅ Found active session: ${activeSession._id}`);
+
+  const workerState = getWorkerStateBySessionId(sessionId);
+  if (!workerState) {
+    console.error(`❌ No worker state for session ${sessionId}`);
+    return;
+  }
+
+  try {
+    const result = await sendCmd(workerState.worker, {
+      command: 'captureAndDetect',
+      cameraIP: lab.cameraIP,
+      sessionId
+    });
+
+    console.log('Worker detection result:', result);
+
+    if (!result || typeof result.detectionsCount !== 'number') {
+      console.warn('⚠️ No detectionsCount found in result');
+      return;
+    }
+
+    const detectionsCount = result.detectionsCount;
+
+    // Create or update Detection document
+    let detectionDoc = await Detection.findOne({
+      lab: lab._id,
+      labSession: activeSession._id
+    });
+
+    try {
+      if (!detectionDoc) {
+        const created = await Detection.create({
+          lab: lab._id,
+          labSession: activeSession._id,
+          timestamp: new Date(),
+          detectionsCount
+        });
+        console.log('✅ Detection document created:', created);
+      } else {
+        const updated = await Detection.updateOne(
+          { _id: detectionDoc._id },
+          { $set: { detectionsCount, timestamp: new Date() } }
+        );
+        console.log('✅ Detection document updated:', updated);
+      }
+    } catch (err) {
+      console.error('❌ Error saving detection:', err);
+    }
+
+    // Update LabSession detections count
+    try {
+      const updatedSession = await LabSession.updateOne(
+        { _id: activeSession._id },
+        { $set: { numberOfDetections: detectionsCount } }
+      );
+      console.log('✅ LabSession updated with detectionsCount:', updatedSession);
+    } catch (err) {
+      console.error('❌ Error updating LabSession:', err);
+    }
+
+  } catch (err) {
+    console.error('❌ Error in runDetectionForLab:', err);
+  }
+}
+export default {
+  runDetectionForLab,
+}
+
+
+

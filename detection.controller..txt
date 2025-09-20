@@ -1,0 +1,101 @@
+// detection.controller.js
+
+import path from 'path';
+import Detection from '../models/detection.model.js';
+import LabSession from '../models/LabSession.model.js';
+import Lab from '../models/Lab.model.js';
+
+import { activeWorkers, sendCmd } from '../utils/scheduler.js';  // Import persistent workers and IPC send
+
+/**
+ * Run detection by sending a capture command to the persistent Python worker for the session.
+ * @param {Object} lab - Lab document from DB
+ * @param {Object} sessionConfig - Session config containing sessionId, startTime, endTime, numberOfDetections
+ * @returns {Promise<Object>} - Detection result from Python worker
+ */
+export async function runDetectionForLab(lab, sessionConfig) {
+  const { sessionId } = sessionConfig;
+
+  // Check if worker for this session is active
+  if (!activeWorkers.has(sessionId)) {
+    throw new Error(`No active detection worker for session ${sessionId}`);
+  }
+
+  const workerController = activeWorkers.get(sessionId);
+  const workerState = workerController.state;
+
+  // Prepare the IPC command to trigger capture
+  const captureCmd = {
+    cmd: 'capture',
+    timestamp: new Date().toISOString(),
+    labId: lab._id.toString(),
+    labName: lab.name,
+    saveDir: path.resolve(process.cwd(), 'screenshots', lab.name),
+  };
+
+  try {
+    // Send the command and wait for the result from Python process
+    const result = await sendCmd(workerState, captureCmd);
+
+    // Parse and store detection in MongoDB
+    let detectedObjects = [];
+
+    if (Array.isArray(result.detectedObjects)) {
+      detectedObjects = result.detectedObjects
+        .filter(obj => typeof obj.count === 'number' && obj.count > 0)
+        .map(obj => ({ label: obj.label, count: obj.count }));
+    } else if (typeof result.count === 'number' && result.count > 0) {
+      detectedObjects.push({ label: 'person', count: result.count });
+    }
+
+    const imagePath = result.screenshot
+      ? path.join('screenshots', lab.name, path.basename(result.screenshot))
+      : '';
+
+    // Find the active session document
+    const activeSession = await LabSession.findOne({
+      _id: sessionId,
+      lab: lab._id,
+      startTime: { $lte: new Date() },
+      endTime: { $gte: new Date() },
+    });
+
+    if (!activeSession) {
+      console.warn(`No active LabSession found for sessionId ${sessionId}`);
+    }
+
+    // Create a detection doc or update existing one
+    // Assuming you create a new Detection document per session or per batch
+
+    const detectionDoc = await Detection.findOne({ labSession: sessionId });
+    if (!detectionDoc) {
+      // If no doc, create one
+      await Detection.create({
+        lab: lab._id,
+        labSession: sessionId,
+        labName: lab.name,
+        detections: [{
+          timestamp: new Date(),
+          detectedObjects,
+          imagePath,
+        }]
+      });
+    } else {
+      // Update existing
+      await Detection.updateOne(
+        { _id: detectionDoc._id },
+        { $push: { detections: {
+          timestamp: new Date(),
+          detectedObjects,
+          imagePath,
+        } } }
+      );
+    }
+
+    return result;
+
+  } catch (error) {
+    console.error(`Error during runDetectionForLab for session ${sessionId}:`, error);
+    throw error;
+  }
+}

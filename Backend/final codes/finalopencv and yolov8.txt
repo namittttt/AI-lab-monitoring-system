@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# detect_worker.py
+import argparse
+import sys
+import os
+import json
+import threading
+import time
+from datetime import datetime
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ----------------- Argument Parsing -----------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--labId", type=str, required=True)
+parser.add_argument("--labName", type=str, required=True)
+parser.add_argument("--source", type=str, default="0")
+parser.add_argument("--save-dir", type=str, default="./screenshots")
+args = parser.parse_args()
+
+# Create base save directory
+os.makedirs(args.save_dir, exist_ok=True)
+
+# ----------------- Load Model -----------------
+model = YOLO("yolov8n.pt")
+
+# Determine camera source
+try:
+    source = int(args.source) if args.source.isdigit() else args.source
+except:
+    source = args.source
+
+# Open camera
+cap = cv2.VideoCapture(source, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+# cap = cv2.VideoCapture('rtsp://192.168.0.100:554/stream')
+if not cap.isOpened():
+    print(json.dumps({"error": "failed_open_camera", "labId": args.labId}))  # *** CHANGED HERE ***
+    sys.stdout.flush()
+    sys.exit(1)
+
+running = True
+cmd_lock = threading.Lock()
+cmd_queue = []
+cmd_event = threading.Event()
+
+def enqueue(cmd):
+    with cmd_lock:
+        cmd_queue.append(cmd)
+        cmd_event.set()
+
+def stdin_reader():
+    while running:
+        line = sys.stdin.readline()
+        if not line:
+            enqueue({"cmd": "stop"})
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            enqueue(obj)
+        except:
+            print(json.dumps({"log": "invalid_cmd", "raw": line}))  # *** CHANGED HERE ***
+            sys.stdout.flush()
+
+t = threading.Thread(target=stdin_reader, daemon=True)
+t.start()
+
+# ----------------- Capture Function -----------------
+def capture_once():
+    frame = None
+    for _ in range(4):
+        ret, frm = cap.read()
+        if ret and frm is not None:
+            frame = frm
+            # Optional: resize for faster detection
+            frame = cv2.resize(frame, (640, 360))
+            break
+        time.sleep(0.05)
+
+    if frame is None:
+        return None
+
+    if np.mean(frame) < 10:
+        return None
+
+    # Run detection
+    try:
+        results = model(frame, verbose=False)
+    except Exception as e:
+        return None
+
+    count = 0
+    for res in results:
+        for box in res.boxes:
+            cls = int(box.cls[0])
+            name = model.names.get(cls, str(cls))
+            if name == "person":
+                count += 1
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+                cv2.putText(frame, "Person", (x1, y1 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+    # Add count text
+    cv2.putText(frame, f"Count: {count}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    screenshot_path = ""
+    if count > 0:
+        # Create lab folder
+        lab_dir = os.path.join(args.save_dir, args.labName)
+        os.makedirs(lab_dir, exist_ok=True)
+
+        fname = f"{args.labName}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        fpath = os.path.join(lab_dir, fname)
+
+        try:
+            cv2.imwrite(fpath, frame)
+            screenshot_path = fpath
+        except:
+            screenshot_path = ""
+
+    return {
+        "labId": args.labId,
+        "labName": args.labName,
+        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "count": count,
+        "screenshot": screenshot_path
+    }
+
+# ----------------- Main Loop -----------------
+try:
+    while running:
+        cmd_event.wait(timeout=1.0)
+        cmd_event.clear()
+        while True:
+            with cmd_lock:
+                if not cmd_queue:
+                    break
+                cmd = cmd_queue.pop(0)
+            if not isinstance(cmd, dict):
+                continue
+            c = cmd.get("cmd")
+            if c == "capture":
+                resp = capture_once()
+                if resp is not None:
+                    resp['seq'] = cmd.get('seq')  # Always add the seq field, even if None
+                    print(json.dumps(resp))
+                    sys.stdout.flush()
+            elif c == "stop":
+                print(json.dumps({"cmd": "stopping", "labId": args.labId}))  # *** CHANGED HERE ***
+                sys.stdout.flush()
+                running = False
+                break
+            else:
+                print(json.dumps({"log": "unknown_cmd", "cmd": c}))  # *** CHANGED HERE ***
+                sys.stdout.flush()
+except KeyboardInterrupt:
+    pass
+finally:
+    try:
+        if cap and cap.isOpened():
+            cap.release()
+    except:
+        pass
+    print(json.dumps({"status": "exiting", "labId": args.labId}))  # *** CHANGED HERE ***
+    sys.stdout.flush()
+    time.sleep(0.05)
+    sys.exit(0)

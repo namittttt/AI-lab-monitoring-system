@@ -1,0 +1,684 @@
+I am building a Node.js backend where:
+I already have working YOLOv8 detection code (via Python worker).
+Labs are stored in MongoDB (Lab.model.js).
+Sessions are stored in MongoDB (LabSession.model.js).
+Detections are stored in MongoDB (detection.model.js).
+I want to drive all lab sessions from an Excel timetable.
+
+Excel file format (timetable.xlsx):
+this is how ill be enetering in excel sheet if required add additional
+| LabName  | DayOfWeek | StartTime | EndTime | Detections | PhoneDetection |
+|----------|-----------|-----------|---------|------------|----------------|
+| LabARear | Monday    | 1:00 PM   | 3:00 PM | 5          | TRUE           |
+| LabB     | Wednesday | 10:30 AM  | 12:30 PM| 4          | FALSE          |
+
+Requirements:
+If LabName does not exist in DB → create a new Lab.
+Parse Indian timings (1:00 PM) and store as UTC ISO in Mongo.
+Each row becomes a LabSession (start, end, numberOfDetections, enablePhoneDetection).
+Use node-cron to:
+Start session at startTime.
+Call startSessionDetections(sessionId) (my existing function).
+Run detections as mentioned seconds until endTime.
+Stop session at endTime automatically.
+Sessions repeat weekly, unless Excel is changed.
+If Excel is updated (new exam schedule, reschedules, etc.), sessions should change.
+
+Code requirements:
+A utility excelScheduler.js that:
+
+Reads Excel (xlsx)
+Creates/updates labs and sessions
+Registers cron jobs for each session
+Integration in server.js to call syncSessionsFromExcel() after DB connect.
+Clean, modular structure.
+Example logs when sessions start/stop.
+Example generated MongoDB document:
+
+{
+  "labId": "68c5258229ab85816f74349c",
+  "labName": "LabARear",
+  "startTime": "2025-09-13T08:12:00Z",
+  "endTime": "2025-09-13T08:14:00Z",
+  "numberOfDetections": 5,
+  "enablePhoneDetection": true
+}
+The above is how used to create session till now so maintain consistency
+IN THE EXCEL ILL BE PROVIDING LAB NAME but not lab id from mongodb so lab name and lab id shld be linked..
+
+Below are my codes
+import { spawn } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import Lab from '../models/Lab.model.js';
+import LabSession from '../models/LabSession.model.js';
+import Detection from '../models/detection.model.js';
+import { uploadScreenshot } from './cloudinary.js';
+import { getIo } from '../utils/socket.js'; // update path as per your project
+
+const activeWorkers = new Map();
+
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function workerScriptPath() {
+  const projectRoot = path.resolve(process.cwd(), '..');
+  return path.resolve(projectRoot, 'yolovenv', 'detect_students.py');
+}
+
+export function sendCmd(state, obj, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    if (!state || !state.child || state.child.killed) return reject(new Error('Worker not available'));
+    const seq = ++state.seq;
+    obj.seq = seq;
+    const line = JSON.stringify(obj) + '\n';
+
+    const timeout = setTimeout(() => {
+      if (state.pending.has(seq)) {
+        state.pending.delete(seq);
+        reject(new Error('Worker response timeout'));
+      }
+    }, timeoutMs);
+
+    state.pending.set(seq, { resolve, reject, timeout });
+    try {
+      state.child.stdin.write(line, 'utf8', (err) => {
+        if (err) {
+          clearTimeout(timeout);
+          state.pending.delete(seq);
+          return reject(err);
+        }
+      });
+    } catch (e) {
+      clearTimeout(timeout);
+      state.pending.delete(seq);
+      return reject(e);
+    }
+  });
+}
+
+function spawnWorker(lab, sessionId, saveDir) {
+  const script = workerScriptPath();
+  if (!fs.existsSync(script)) throw new Error(`Worker script not found at ${script}`);
+
+  const args = [
+    script,
+    '--labId', lab._id.toString(),
+    '--labName', lab.name,
+    '--source', lab.cameraIP || '0',
+    '--save-dir', saveDir || path.resolve(process.cwd(), 'screenshots', lab.name)
+  ];
+
+  const child = spawn('python', args, { cwd: process.cwd(), env: { ...process.env } });
+
+  const state = {
+    child,
+    seq: 0,
+    pending: new Map(),
+    buf: '',
+    isRunning: false
+  };
+
+  child.stdout.on('data', chunk => {
+    state.buf += chunk.toString();
+    let idx;
+    while ((idx = state.buf.indexOf('\n')) >= 0) {
+      const line = state.buf.slice(0, idx).trim();
+      state.buf = state.buf.slice(idx + 1);
+      if (!line) continue;
+      const parsed = safeJsonParse(line);
+      if (!parsed) {
+        console.log(`[PY LOG][${sessionId}]`, line);
+        continue;
+      }
+      const seq = parsed.seq;
+      if (seq != null && state.pending.has(seq)) {
+        const { resolve, timeout } = state.pending.get(seq);
+        clearTimeout(timeout);
+        state.pending.delete(seq);
+        resolve(parsed);
+      } else {
+        console.log(`[PY MSG][${sessionId}]`, parsed);
+      }
+    }
+  });
+
+  child.stderr.on('data', d => console.error(`[PY ERR][${sessionId}]`, d.toString()));
+
+  child.on('close', (code, sig) => {
+    console.log(`Worker closed for ${sessionId} code=${code} sig=${sig}`);
+    for (const [s, { reject, timeout }] of state.pending.entries()) {
+      clearTimeout(timeout);
+      reject(new Error('Worker exited'));
+    }
+    state.pending.clear();
+    if (activeWorkers.has(sessionId)) {
+      const ctrl = activeWorkers.get(sessionId);
+      if (ctrl.intervalId) clearInterval(ctrl.intervalId);
+      if (ctrl.startTimeoutId) clearTimeout(ctrl.startTimeoutId);
+      activeWorkers.delete(sessionId);
+    }
+  });
+
+  child.on('error', e => console.error('Worker spawn error', e));
+
+  return state;
+}
+
+/**
+ * Broadcast occupancy in real-time via Socket.IO
+ */
+async function broadcastOccupancy(lab, peopleCount) {
+  const occupancyPercent = lab.capacity > 0
+    ? Math.min(100, (peopleCount / lab.capacity) * 100)
+    : 0;
+
+   console.log(`[Occupancy] Lab: ${lab.name} | People: ${peopleCount} / Capacity: ${lab.capacity} | ${occupancyPercent.toFixed(2)}%`);
+   
+  getIo().emit('labOccupancyUpdate', {
+    labId: lab._id,
+    labName: lab.name,
+    peopleCount,
+    occupancyPercent: Number(occupancyPercent.toFixed(2))
+  });
+
+  // Also update current utilization in DB for dashboard reference
+  await Lab.updateOne(
+    { _id: lab._id },
+    { $set: { currentUtilization: occupancyPercent } }
+  );
+}
+
+// Save detection in DB + broadcast occupancy
+async function persistDetection(lab, sessionId, json) {
+  console.log(`[persistDetection] Called for sessionId=${sessionId}, lab=${lab.name}`);
+  try {
+    const activeSession = await LabSession.findById(sessionId);
+    if (!activeSession) {
+      console.warn(`Session ${sessionId} not found when saving detection`);
+      return;
+    }
+
+    let doc = await Detection.findOne({
+      lab: lab._id,
+      labSession: activeSession._id
+    });
+
+    if (!doc) {
+      doc = await Detection.create({
+        lab: lab._id,
+        labSession: activeSession._id,
+        labName: lab.name,
+        detections: [],
+        detectionsCount: 0
+      });
+    }
+
+    const detectedObjects = Array.isArray(json.detectedObjects) && json.detectedObjects.length
+      ? json.detectedObjects.filter(o => typeof o.count === 'number')
+      : (typeof json.count === 'number' ? [{ label: 'person', count: json.count }] : []);
+
+    const peopleObj = detectedObjects.find(o => o.label && o.label.toLowerCase && o.label.toLowerCase() === 'person');
+    const peopleCount = peopleObj ? peopleObj.count : 0;
+
+    // json.screenshot is expected to be a local path (absolute or relative)
+    let cloudUrl = '';
+    if (json.screenshot) {
+      // Build absolute path if needed — screenshots stored under process.cwd()/screenshots/<lab.name>/...
+      const candidatePath = path.isAbsolute(json.screenshot)
+        ? json.screenshot
+        : path.join(process.cwd(), json.screenshot);
+
+      try {
+        const uploadRes = await uploadScreenshot(candidatePath, { deleteLocal: true, folder: `lab_screenshots/${lab.name}` });
+        cloudUrl = uploadRes.url;
+        console.log('[persistDetection] Uploaded screenshot to Cloudinary:', cloudUrl);
+      } catch (uploadErr) {
+        console.error('[persistDetection] Cloudinary upload failed:', uploadErr);
+        // fallback: preserve the local path (if file still exists)
+        if (fs.existsSync(candidatePath)) {
+          cloudUrl = `/screenshots/${lab.name}/${path.basename(candidatePath)}`; // static route if still served
+        } else {
+          cloudUrl = '';
+        }
+      }
+    }
+
+    const entryTimestamp = json.timestamp ? new Date(json.timestamp) : new Date();
+    const detectionEntry = {
+      timestamp: entryTimestamp,
+      detectedObjects,
+      imagePath: cloudUrl,      // store cloud URL (or empty string)
+      sessionId: activeSession._id
+    };
+
+    await Detection.updateOne(
+      { _id: doc._id },
+      {
+        $push: { detections: detectionEntry },
+        $inc: { detectionsCount: 1 }
+      }
+    );
+
+    await LabSession.updateOne(
+      { _id: activeSession._id },
+      {
+        $set: {
+          lastDetectionAt: entryTimestamp,
+          sessionId: activeSession._id
+        },
+        $inc: { detectionsCount: 1 }
+      }
+    );
+
+    // Broadcast occupancy in real-time using previous function
+    await broadcastOccupancy(lab, peopleCount);
+
+    // Emit the immediate detection + image to front-end
+    try {
+      getIo().emit('detection', {
+        labId: lab._id,
+        labName: lab.name,
+        sessionId: activeSession._id,
+        timestamp: entryTimestamp,
+        detectedObjects,
+        peopleCount,
+        imageUrl: cloudUrl
+      });
+    } catch (e) {
+      console.warn('Failed to emit detection via socket:', e);
+    }
+
+    // Phone violation event unchanged
+    if (json.phoneViolation === true && activeSession.enablePhoneDetection === true) {
+      getIo().emit('phoneViolation', {
+        labId: lab._id,
+        labName: lab.name,
+        sessionId: activeSession._id,
+        sessionName: activeSession.labName,
+        timestamp: entryTimestamp
+      });
+    }
+
+  } catch (err) {
+    console.error('Error persisting detection:', err);
+  }
+}
+
+export async function startSessionDetections(sessionId) {
+  if (activeWorkers.has(sessionId)) {
+    console.log(`Session ${sessionId} already running`);
+    return;
+  }
+
+  const session = await LabSession.findById(sessionId);
+  if (!session) {
+    console.error(`Session ${sessionId} not found`);
+    return;
+  }
+
+  const lab = await Lab.findById(session.lab);
+  if (!lab) {
+    console.error(`Lab for session ${sessionId} not found`);
+    return;
+  }
+
+  const start = new Date(session.startTime);
+  const end = new Date(session.endTime);
+  const runs = session.numberOfDetections || 1;
+
+  if (!(end > start)) {
+    console.error('Invalid session times');
+    return;
+  }
+
+  const totalSeconds = (end - start) / 1000;
+  const intervalSeconds = totalSeconds / runs;
+
+  console.log(`Starting session ${sessionId} (lab ${lab.name}) start=${start} end=${end} runs=${runs} every=${intervalSeconds}s`);
+
+  const saveDir = path.resolve(process.cwd(), 'screenshots', lab.name);
+  fs.mkdirSync(saveDir, { recursive: true });
+
+  const state = spawnWorker(lab, sessionId, saveDir);
+
+  const controller = {
+    child: state.child,
+    state,
+    lab,   // ✅ STORE lab inside controller
+    session, // optional: store session too
+    intervalId: null,
+    startTimeoutId: null,
+    runsDone: 0
+  };
+
+  activeWorkers.set(sessionId, controller);
+
+  const doCapture = async () => {
+    if (!activeWorkers.has(sessionId)) return;
+    const now = new Date();
+    if (now > end || controller.runsDone >= runs) {
+      console.log(`Session ${sessionId} ended or runs completed`);
+      await stopSessionDetections(sessionId);
+      return;
+    }
+    if (state.isRunning) {
+      console.log(`Previous capture still running for ${sessionId}, skipping`);
+      return;
+    }
+    state.isRunning = true;
+    try {
+      const cmd = {
+        cmd: 'capture',
+        timestamp: new Date().toISOString(),
+        enablePhoneDetection: session.enablePhoneDetection
+      };
+      const resp = await sendCmd(state, cmd, Math.max(15000, intervalSeconds * 1000));
+      console.log(`[doCapture] Received response:`, resp);
+      await persistDetection(lab, sessionId, resp);
+      controller.runsDone += 1;
+      console.log(`Session ${sessionId} capture ${controller.runsDone}/${runs} done`);
+    } catch (err) {
+      console.error(`Capture error for ${sessionId}:`, err.message || err);
+    } finally {
+      state.isRunning = false;
+    }
+  };
+
+  const now = new Date();
+  if (start > now) {
+    const delay = start - now;
+    controller.startTimeoutId = setTimeout(async () => {
+      controller.startTimeoutId = null;
+      await doCapture();
+      controller.intervalId = setInterval(doCapture, Math.max(1000, intervalSeconds * 1000));
+    }, delay);
+    console.log(`Worker spawned. First capture scheduled in ${Math.round(delay / 1000)}s`);
+  } else {
+    console.log('Session start time is in the past or now. Starting capture immediately.');
+    await doCapture();
+    controller.intervalId = setInterval(doCapture, Math.max(1000, intervalSeconds * 1000));
+  }
+}
+
+function deleteFolderRecursive(folderPath) {
+  if (fs.existsSync(folderPath)) {
+    fs.readdirSync(folderPath).forEach((file) => {
+      const curPath = path.join(folderPath, file);
+      try {
+        if (fs.lstatSync(curPath).isDirectory()) {
+          deleteFolderRecursive(curPath); // recurse for subdir
+        } else {
+          fs.unlinkSync(curPath); // delete file
+        }
+      } catch (err) {
+        console.warn('Failed to delete', curPath, err.message);
+      }
+    });
+
+    try {
+      fs.rmdirSync(folderPath); // finally remove the folder
+      console.log(`Deleted lab folder ${folderPath}`);
+    } catch (err) {
+      console.warn(`Failed to delete lab folder ${folderPath}`, err.message);
+    }
+  }
+}
+
+export async function stopSessionDetections(sessionId) {
+  if (!activeWorkers.has(sessionId)) {
+    console.log(`No active worker for ${sessionId}`);
+    return;
+  }
+  const controller = activeWorkers.get(sessionId);
+
+  if (controller.startTimeoutId) {
+    clearTimeout(controller.startTimeoutId);
+    controller.startTimeoutId = null;
+  }
+  if (controller.intervalId) {
+    clearInterval(controller.intervalId);
+    controller.intervalId = null;
+  }
+
+  const state = controller.state;
+  try {
+    if (state && state.child && !state.child.killed) {
+      await sendCmd(state, { cmd: 'stop' }, 3000);
+    }
+  } catch {}
+
+  setTimeout(() => {
+    try {
+      if (state && state.child && !state.child.killed) {
+        state.child.kill('SIGTERM');
+        console.log(`Force-killed worker for ${sessionId}`);
+      }
+    } catch (e) {
+      console.error('Error force-killing worker:', e);
+    }
+  }, 2500);
+
+  if (state && state.pending) {
+    for (const [s, { reject, timeout }] of state.pending.entries()) {
+      clearTimeout(timeout);
+      reject(new Error('Session stopped'));
+    }
+    state.pending.clear();
+  }
+
+  // ✅ Cleanup lab screenshots + folder
+  try {
+    if (controller.lab) {
+      const labDir = path.resolve(process.cwd(), 'screenshots', controller.lab.name);
+      deleteFolderRecursive(labDir);
+    }
+  } catch (cleanupErr) {
+    console.error('Cleanup error:', cleanupErr);
+  }
+
+  activeWorkers.delete(sessionId);
+  console.log(`Stopped detections for session ${sessionId}`);
+}
+
+export function stopAllDetections() {
+  for (const id of Array.from(activeWorkers.keys())) {
+    stopSessionDetections(id).catch(e => console.error(e));
+  }
+}
+
+export function getWorkerStateBySessionId(sessionId) {
+  const controller = activeWorkers.get(sessionId);
+  return controller ? controller.state : null;
+}import Detection from '../models/detection.model.js';
+import Lab from '../models/Lab.model.js';
+import LabSession from '../models/LabSession.model.js';
+import path from 'path';
+import fs from 'fs';
+import { sendCmd } from '../utils/scheduler.js';
+
+
+async function runDetectionForLab(labId, sessionId) {
+  console.log('>>> runDetectionForLab called');
+  console.log('LabId:', labId, 'SessionId:', sessionId);
+
+  const lab = await Lab.findById(labId);
+  if (!lab) {
+    console.error(`Lab ${labId} not found`);
+    return;
+  }
+
+  // For debugging: skip time constraints to see if detection is inserted
+  const activeSession = await LabSession.findById(sessionId);
+  if (!activeSession) {
+    console.error(`❌ Session ${sessionId} not found`);
+    return;
+  }
+
+  console.log(`✅ Found active session: ${activeSession._id}`);
+
+  const workerState = getWorkerStateBySessionId(sessionId);
+  if (!workerState) {
+    console.error(`❌ No worker state for session ${sessionId}`);
+    return;
+  }
+
+  try {
+    const result = await sendCmd(workerState.worker, {
+      command: 'captureAndDetect',
+      cameraIP: lab.cameraIP,
+      sessionId
+    });
+
+    console.log('Worker detection result:', result);
+
+    if (!result || typeof result.detectionsCount !== 'number') {
+      console.warn('⚠️ No detectionsCount found in result');
+      return;
+    }
+
+    const detectionsCount = result.detectionsCount;
+
+    // Create or update Detection document
+    let detectionDoc = await Detection.findOne({
+      lab: lab._id,
+      labSession: activeSession._id
+    });
+
+    try {
+      if (!detectionDoc) {
+        const created = await Detection.create({
+          lab: lab._id,
+          labSession: activeSession._id,
+          timestamp: new Date(),
+          detectionsCount
+        });
+        console.log('✅ Detection document created:', created);
+      } else {
+        const updated = await Detection.updateOne(
+          { _id: detectionDoc._id },
+          { $set: { detectionsCount, timestamp: new Date() } }
+        );
+        console.log('✅ Detection document updated:', updated);
+      }
+    } catch (err) {
+      console.error('❌ Error saving detection:', err);
+    }
+
+    // Update LabSession detections count
+    try {
+      const updatedSession = await LabSession.updateOne(
+        { _id: activeSession._id },
+        { $set: { numberOfDetections: detectionsCount } }
+      );
+      console.log('✅ LabSession updated with detectionsCount:', updatedSession);
+    } catch (err) {
+      console.error('❌ Error updating LabSession:', err);
+    }
+
+  } catch (err) {
+    console.error('❌ Error in runDetectionForLab:', err);
+  }
+}
+export default {
+  runDetectionForLab,
+}// Backend/src/models/Lab.js
+import mongoose from "mongoose";
+
+const labSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  capacity: { type: Number, default: 10 },
+  cameraStatus: { type: String, enum: ['online','offline','unknown'], default: 'unknown' },
+  cameraIP: { type: String, required: true },
+  ipRange: { type: String, default: '' },
+  currentUtilization: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Lab = mongoose.model('Lab',labSchema);
+export default Lab ;
+// module.exports = mongoose.model('Lab', labSchema);import mongoose from "mongoose";
+
+const detectionConfigSchema = new mongoose.Schema({
+  requiredCount: { type: Number, required: true }, // number of detections user wants
+  startTime: { type: Date, required: true },
+  endTime: { type: Date, required: true }
+}, { _id: false });
+
+const labSessionSchema = new mongoose.Schema({
+  lab: { type: mongoose.Schema.Types.ObjectId, ref: 'Lab', required: true },
+  labName: { type: String, required: true },
+
+  startTime: { type: Date, required: true },
+  endTime: { type: Date, required: true },
+
+  numberOfDetections: { type: Number, required: true, default:15}, // user-specified
+  detectionFrequency: { type: Number, default: 60 }, // seconds
+
+  enablePhoneDetection: { type: Boolean, default: false },
+
+  detectionConfig: detectionConfigSchema, // optional config
+
+  // New fields to keep session-level summary
+  lastDetectionAt: { type: Date },
+  detectionsCount: { type: Number, default: 0 },
+
+  createdAt: { type: Date, default: Date.now }
+});
+
+const LabSession = mongoose.model('LabSession', labSessionSchema);
+
+export default LabSession;
+
+import mongoose from 'mongoose';
+
+const detectedObjectSchema = new mongoose.Schema({
+  label: { type: String, required: true },  // e.g., 'person', 'laptop'
+  count: { type: Number, required: true }
+}, { _id: false });
+
+const detectionEntrySchema = new mongoose.Schema({
+  timestamp: { type: Date, default: Date.now },
+  detectedObjects: { type: [detectedObjectSchema], default: [] },
+  imagePath: { type: String, default: '' },
+  // store session id explicitly for traceability
+  sessionId: { type: mongoose.Schema.Types.ObjectId, ref: 'LabSession' }
+}, { _id: false });
+
+const detectionSchema = new mongoose.Schema({
+  lab: { type: mongoose.Schema.Types.ObjectId, ref: 'Lab', required: true },
+  labSession: { type: mongoose.Schema.Types.ObjectId, ref: 'LabSession', required: true },
+  labName: { type: String, required: true },
+  // array of detection entries (captures)
+  detections: { type: [detectionEntrySchema], default: [] },
+  // optionally keep a top-level summary count (redundant with LabSession but useful)
+  detectionsCount: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Detection = mongoose.model('Detection', detectionSchema);
+export default Detection;
+
+these are my already installed dependencies..
+ "agenda": "^5.0.0",
+    "axios": "^1.11.0",
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.2",
+    "child-process-promise": "^2.1.3",
+    "chokidar": "^4.0.3",
+    "cloudinary": "^2.7.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "moment-timezone": "^0.6.0",
+    "mongoose": "^8.17.1",
+    "morgan": "^1.10.1",
+    "node-cron": "^4.2.1",
+    "socket.io": "^4.8.1"   and also include routes because i will be uploading the excel sheet from frontend..and now ill test with post man...give me all codes entire and if changes need to made in exsisting code mention that too
+
+
+
