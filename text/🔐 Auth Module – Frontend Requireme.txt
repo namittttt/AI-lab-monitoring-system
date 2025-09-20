@@ -1,0 +1,174 @@
+🔐 Auth Module – Frontend Requirements
+1. Signup (POST /signup)
+
+Collect fullName, email, password from user.
+
+Send to backend in request body.
+
+On success:
+
+User is auto-authenticated (JWT cookie is set).
+
+Store returned user info in frontend state.
+
+Redirect user to dashboard/home.
+
+On error:
+
+Show validation message (e.g., missing fields, invalid email, password too short).
+
+2. Login (POST /login)
+
+Collect email, password.
+
+Send to backend in request body.
+
+On success:
+
+JWT cookie is set automatically.
+
+Store returned user info in frontend state.
+
+Redirect user to dashboard/home.
+
+On error:
+
+Show error (e.g., invalid email/password).
+
+3. Logout (POST /logout)
+
+Call logout API.
+
+On success:
+
+JWT cookie is cleared by backend.
+
+Clear user data from frontend state.
+
+Redirect user to login page.
+
+4. Get Current User (GET /me)
+
+Call this API when app loads or page refreshes.
+
+If success:
+
+Use returned user object to keep user logged in.
+
+If error (401/403):
+
+Redirect to login page (session expired / no JWT cookie).
+
+🧪 Lab API – Frontend Requirements
+1. Create Lab (POST /labs)
+
+Required in frontend form: name (mandatory).
+
+Optional: capacity, cameraStatus, cameraIP.
+
+Backend sets defaults if missing (cameraStatus: online, cameraIP: 0, etc.).
+
+On success → new lab object returned.
+
+Frontend usage: for admin panel (adding new labs).
+
+2. List Labs (GET /)
+
+Returns all labs.
+
+Use in frontend:
+
+Display lab dashboard (cards/tables).
+
+Show capacity, utilization, camera status.
+
+3. Get Lab (GET /:id)
+
+Returns lab details + last 5 sessions.
+
+Use in frontend:
+
+Lab details page.
+
+Display recent sessions list.
+
+⏱ LabSession API – Frontend Requirements
+1. Create Session (POST /sessions)
+
+Required in frontend form: labId, startTime, endTime.
+
+Optional: detectionFrequency, numberOfDetections, enablePhoneDetection.
+
+Backend starts detection scheduler automatically.
+
+On success → returns sessionId.
+
+Use in frontend: for scheduling sessions in labs.
+
+2. Get Session (GET /sessions/:sessionId)
+
+Returns session details + last 20 detections.
+
+Use in frontend:
+
+Session details view.
+
+Show detection timeline (with snapshots, objects detected).
+
+3. Add Detection (POST /sessions/detection)
+
+Required: labId, labSessionId, detectedObjects.
+
+Optional: imagePath.
+
+Backend checks session validity (within time range).
+
+Use in frontend: only if you need manual detection entry (testing/admin).
+
+4. Get Occupancy (GET /sessions/:sessionId/occupancy)
+
+Returns averageCount and occupancyPercent.
+
+Use in frontend:
+
+Occupancy graph.
+
+Utilization stats in real time.
+
+5. Update Detection Config (POST /sessions/:sessionId/config)
+
+Required: requiredCount, startTime, endTime.
+
+Updates detection rules for session.
+
+Use in frontend:
+
+Config panel (e.g., set threshold for alerts, adjust detection timings).
+
+6. Get Detection Config (GET /sessions/:sessionId/config)
+
+Returns current detection config for session.
+
+Use in frontend:
+
+Pre-fill config form.
+
+Show current active thresholds/timings.
+
+📌 Frontend Integration Checklist
+
+Labs Page → use listLabs.
+
+Lab Details Page → use getLab.
+
+Session Creation Form → use createLabSession.
+
+Session Page →
+
+Use getLabSession (session info + detections).
+
+Use getSessionOccupancy (stats/graphs).
+
+Use getDetectionConfig + updateDetectionConfig (manage detection settings).
+
+Admin/Testing → addDetection
