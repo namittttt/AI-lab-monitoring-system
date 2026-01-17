@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import dotenv from 'dotenv';
 import http from 'http';
@@ -7,81 +6,99 @@ import path from 'path';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 
 import { connectDB } from './lib/db.js';
-
-// Routes
-import detectionRoutes from './routes/detection.route.js';
-import excelRoutes from './routes/excelRoutes.route.js';
-import reportRoutes from './routes/report.route.js';
-
-// Excel scheduler
+import { initIo } from './utils/socket.js';
 import { syncSessionsFromExcel } from './utils/excelScheduler.js';
 
-// Socket.io
-import { initIo } from './utils/socket.js';
+// ✅ NEW: Import upgraded report scheduler (runs daily at 5 PM IST)
+import runScheduler from './utils/reportScheduler.js';
 
-// Models
+// ✅ Routes
+import authRoutes from './routes/auth.route.js';
+import excelRoutes from './routes/excelRoutes.route.js';
+import detectionRoutes from './routes/detection.route.js';
+import reportRoutes from './routes/report.route.js';
+import labRoutes from './routes/labs.route.js';
+import labSessionRoutes from './routes/labSession.route.js';
+
+// ✅ Models
 import Lab from './models/Lab.model.js';
 
-// Auto-start report scheduler (cron jobs)
-import './utils/reportScheduler.js';
-
 dotenv.config();
+
+// --- Setup paths ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5001;
 
-// Initialize socket.io
-initIo(server);
-
-// Middleware
-app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
+// --- Middleware ---
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.use(morgan('dev'));
 
-// Static folder for screenshots
+// --- Static Folders ---
 const screenshotsFolder = path.resolve(
   process.env.SCREENSHOTS_DIR || path.join(process.cwd(), 'screenshots')
 );
+if (!fs.existsSync(screenshotsFolder)) {
+  fs.mkdirSync(screenshotsFolder, { recursive: true });
+}
 app.use('/screenshots', express.static(screenshotsFolder));
 
-// API routes
+const uploadsFolder = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsFolder)) {
+  fs.mkdirSync(uploadsFolder, { recursive: true });
+}
+app.use('/uploads', express.static(uploadsFolder));
+
+// --- API Routes ---
+app.use('/api/auth', authRoutes);
 app.use('/api/excel', excelRoutes);
 app.use('/api/detections', detectionRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/labs', labRoutes);
+app.use('/api', labSessionRoutes);
 
-// Health check route
+// --- Health Check ---
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// --- Server startup ---
+// --- Start Server ---
 const startServer = async () => {
   try {
-    // Connect to MongoDB
     await connectDB();
     console.log('✅ MongoDB connected');
 
-    // Ensure a default lab exists
-    const defaultLabName = 'LabARear';
+    // Ensure default lab exists
+    const defaultLabName = 'CCoffice2';
     let lab = await Lab.findOne({ name: defaultLabName });
     if (!lab) {
       lab = await Lab.create({
         name: defaultLabName,
         capacity: 50,
         cameraStatus: 'online',
-        cameraIP:
-          'rtsp://admin:password@10.10.61.216:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif',
+        // cameraIP: process.env.DEFAULT_CAMERA_URL || '',
+        cameraIP: 'rtsp://admin:epmcgit123456@10.10.61.244',
         ipRange: '',
         currentUtilization: 0,
       });
       console.log(`🆕 Created default lab: ${lab.name}`);
     }
 
-    // Look for any Excel file (.xlsx) in project root
+    // Excel Sync
     const files = fs.readdirSync(process.cwd());
-    const excelFile = files.find(f => f.toLowerCase().endsWith('.xlsx'));
-
+    const excelFile = files.find((f) => f.toLowerCase().endsWith('.xlsx'));
     if (excelFile) {
       try {
         const filePath = path.resolve(process.cwd(), excelFile);
@@ -91,13 +108,17 @@ const startServer = async () => {
       } catch (err) {
         console.error('❌ Excel sync failed:', err);
       }
-    } else {
-      console.log('⚠️ No .xlsx file found at project root; waiting for uploads.');
     }
 
-    // Start HTTP server
+    // Initialize Socket.io
+    initIo(server);
+
+    // ✅ Start the daily report scheduler (5 PM IST)
+    runScheduler();
+
+    // Start listening
     server.listen(PORT, () =>
-      console.log(`🚀 Server listening on port ${PORT}`)
+      console.log(`🚀 Server running on http://localhost:${PORT}`)
     );
   } catch (err) {
     console.error('❌ Failed to start server:', err);
@@ -111,32 +132,6 @@ export default app;
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // import express from 'express';
 // import dotenv from 'dotenv';
 // import http from 'http';
@@ -144,128 +139,115 @@ export default app;
 // import path from 'path';
 // import cors from 'cors';
 // import cookieParser from 'cookie-parser';
+// import fs from 'fs';
+// import { fileURLToPath } from 'url';
+// import { dirname } from 'path';
 
 // import { connectDB } from './lib/db.js';
+// import { initIo } from './utils/socket.js';
+// import { syncSessionsFromExcel } from './utils/excelScheduler.js';
+// import './utils/reportScheduler.js';
 
-// // Routes
+// // ✅ Routes
 // import authRoutes from './routes/auth.route.js';
-// import settingsRoutes from './routes/settings.route.js';
-// import labsRoutes from './routes/labs.route.js';
-// import dashboardRoutes from './routes/dashboard.route.js';
-// import violationsRoutes from './routes/violations.route.js';
+// import excelRoutes from './routes/excelRoutes.route.js';
 // import detectionRoutes from './routes/detection.route.js';
+// import reportRoutes from './routes/report.route.js';
+// import labRoutes from './routes/labs.route.js';
 // import labSessionRoutes from './routes/labSession.route.js';
 
-// // Models
-// import Setting from './models/setting.model.js';
+// // ✅ Models
 // import Lab from './models/Lab.model.js';
-// import LabSession from './models/LabSession.model.js';
-
-// // Detection scheduler utils
-// import { startSessionDetections, stopAllDetections } from './utils/scheduler.js';
 
 // dotenv.config();
+
+// // --- Setup paths ---
+// const __filename = fileURLToPath(import.meta.url);
+// const __dirname = dirname(__filename);
+
 // const app = express();
 // const server = http.createServer(app);
 // const PORT = process.env.PORT || 5001;
 
-// // Middleware
-// app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
-// app.use(express.json());
+// // --- Middleware ---
+// app.use(
+//   cors({
+//     origin: process.env.CLIENT_URL || 'http://localhost:5173',
+//     credentials: true,
+//   })
+// );
+// app.use(express.json({ limit: '10mb' }));
 // app.use(cookieParser());
 // app.use(morgan('dev'));
 
-// // Static files for screenshots
-// const screenshotsFolder = path.resolve(process.env.SCREENSHOTS_DIR || path.join(process.cwd(), 'screenshots'));
+// // --- Static Folders ---
+// const screenshotsFolder = path.resolve(
+//   process.env.SCREENSHOTS_DIR || path.join(process.cwd(), 'screenshots')
+// );
+// if (!fs.existsSync(screenshotsFolder)) {
+//   fs.mkdirSync(screenshotsFolder, { recursive: true });
+// }
 // app.use('/screenshots', express.static(screenshotsFolder));
 
-// // API routes
+// const uploadsFolder = path.join(__dirname, 'uploads');
+// if (!fs.existsSync(uploadsFolder)) {
+//   fs.mkdirSync(uploadsFolder, { recursive: true });
+// }
+// app.use('/uploads', express.static(uploadsFolder));
+
+// // --- API Routes ---
 // app.use('/api/auth', authRoutes);
-// app.use('/api/settings', settingsRoutes);
-// app.use('/api/labs', labsRoutes);
-// app.use('/api/dashboard', dashboardRoutes);
-// app.use('/api/violations', violationsRoutes);
+// app.use('/api/excel', excelRoutes);
 // app.use('/api/detections', detectionRoutes);
-// app.use('/api/labs', labSessionRoutes); // Session-specific routes
+// app.use('/api/reports', reportRoutes);
+// app.use('/api/labs', labRoutes);              // ✅ fixes your 404
+// app.use('/api', labSessionRoutes);            // ✅ lab session endpoints
 
-// // --- Detection session endpoints ---
-// app.post('/api/start-session', async (req, res) => {
-//   try {
-//     const { labId, startTime, endTime, detectionsCount } = req.body;
+// // --- Health Check ---
+// app.get('/health', (req, res) => res.json({ ok: true }));
 
-//     if (!labId || !startTime || !endTime || !detectionsCount) {
-//       return res.status(400).json({
-//         message: 'labId, startTime, endTime, detectionsCount are required',
-//       });
-//     }
-
-//     const start = new Date(startTime);
-//     const end = new Date(endTime);
-
-//     if (isNaN(start) || isNaN(end) || end <= start) {
-//       return res.status(400).json({ message: 'Invalid start or end time' });
-//     }
-
-//     // Create session
-//     const session = await LabSession.create({
-//       lab: labId,
-//       labName: req.body.labName,
-//       startTime: start,
-//       endTime: end,
-//       numberOfDetections: detectionsCount,
-//     });
-
-//     console.log(`📅 Session created: ${session._id}`);
-//     startSessionDetections(session._id);
-
-//     res.status(200).json({
-//       message: 'Session scheduled and started successfully',
-//       sessionId: session._id,
-//     });
-//   } catch (err) {
-//     console.error('❌ Error starting session:', err);
-//     res.status(500).json({ message: 'Server error' });
-//   }
-// });
-
-// app.post('/api/stop-all-sessions', (req, res) => {
-//   stopAllDetections();
-//   res.status(200).json({ message: 'All detection sessions stopped' });
-// });
-
-// // --- Server startup ---
+// // --- Start Server ---
 // const startServer = async () => {
 //   try {
 //     await connectDB();
-//     console.log('✅ Connected to database');
+//     console.log('✅ MongoDB connected');
 
 //     // Ensure default lab exists
-//     const defaultLabName = 'Lab101';
+//     const defaultLabName = 'LabARear';
 //     let lab = await Lab.findOne({ name: defaultLabName });
 //     if (!lab) {
 //       lab = await Lab.create({
 //         name: defaultLabName,
-//         capacity: 1,
+//         capacity: 50,
 //         cameraStatus: 'online',
-//         cameraIP: '0', // default webcam
+//         cameraIP: process.env.DEFAULT_CAMERA_URL || '',
 //         ipRange: '',
 //         currentUtilization: 0,
 //       });
 //       console.log(`🆕 Created default lab: ${lab.name}`);
 //     }
 
-//     // Ensure default frequency setting exists
-//     let setting = await Setting.findOne({ key: 'default_detections_per_session' });
-//     if (!setting) {
-//       setting = await Setting.create({
-//         key: 'default_detections_per_session',
-//         value: Number(process.env.DEFAULT_DETECTIONS || 10),
-//       });
+//     // Excel Sync
+//     const files = fs.readdirSync(process.cwd());
+//     const excelFile = files.find((f) => f.toLowerCase().endsWith('.xlsx'));
+//     if (excelFile) {
+//       try {
+//         const filePath = path.resolve(process.cwd(), excelFile);
+//         console.log(`📘 Found ${excelFile} - syncing sessions...`);
+//         const res = await syncSessionsFromExcel(filePath);
+//         console.log('✅ Initial Excel sync result:', res);
+//       } catch (err) {
+//         console.error('❌ Excel sync failed:', err);
+//       }
 //     }
 
-//     server.listen(PORT, () => {
-//       console.log(`🚀 Server listening on port ${PORT}`);
-//     });
+//     // Initialize Socket.io
+//     initIo(server);
+
+//     // Start listening
+//     server.listen(PORT, () =>
+//       console.log(`🚀 Server running on http://localhost:${PORT}`)
+//     );
 //   } catch (err) {
 //     console.error('❌ Failed to start server:', err);
 //     process.exit(1);
@@ -273,135 +255,6 @@ export default app;
 // };
 
 // startServer();
-// export default app;
-
-
-
-
-
-// const PORT = process.env.PORT || 5001;
-
-// const server = http.createServer(app);
-
-
-// const startServer = async () => {
-//   try {
-//     await connectDB();
-//     console.log('Connected to database');
-
-//     // Create a default lab if not exists (for testing/demo purposes)
-//     const LabId = 'Lab101';
-//     let lab = await Lab.findOne({ name: LabId });
-//     if (!lab) {
-//       lab = await Lab.create({
-//         name: LabId,
-//         capacity: 1,
-//         cameraStatus: 'online',
-//         cameraIP: '0', // default webcam
-//         ipRange: '',
-//         currentUtilization: 0,
-//       });
-//       console.log(`Created test lab: ${lab.name}`);
-//     } else {
-//       console.log(`Test lab already exists: ${lab.name}`);
-//     }
-
-//     // Start HTTP server
-//     server.listen(PORT, async () => {
-//       console.log(`Server listening on port ${PORT}`);
-
-//       // Load global frequency setting or create default
-//       let setting = await Setting.findOne({ key: 'frequency_seconds' });
-//       if (!setting) {
-//         setting = await Setting.create({
-//           key: 'frequency_seconds',
-//           value: Number(process.env.DEFAULT_FREQUENCY_SECONDS || 60),
-//         });
-//       }
-
-//       const globalFreq = Number(setting.value);
-
-//       try {
-//         // Schedule the detection job that respects session frequencies
-//         scheduleDetection(globalFreq, detectionJob);
-//         console.log(`Scheduled detection job with global frequency ${globalFreq} seconds`);
-//       } catch (err) {
-//         console.error('Failed to schedule detection job:', err.message);
-//       }
-//     });
-//   } catch (err) {
-//     console.error('Failed to start server:', err);
-//     process.exit(1);
-//   }
-// };
-
-// startServer();
 
 // export default app;
 
-
-
-
-
-
-
-
-
-
-
-// const startServer = async () => {
-//     await connectDB();
-
-//     const LabId = "Lab101";
-//     let lab = await Lab.findOne({ name: LabId });
-//     if (!lab) {
-//         lab = await Lab.create({
-//             name: LabId,
-//             capacity: 1, // since it's just your laptop
-//             cameraStatus: 'online',
-//             cameraIP: '0', // "0" tells OpenCV to use default webcam
-//             ipRange: '',
-//             currentUtilization: 0
-//         });
-//         console.log(`Created test lab: ${lab.name}`);
-//     } else {
-//         console.log(`Test lab already exists: ${lab.name}`);
-//     }
-
-//     server.listen(PORT, async () => {
-//         console.log(`Server listening on port ${PORT}`);
-
-//         // read frequency from DB or set default
-//         let setting = await Setting.findOne({ key: 'frequency_seconds' });
-//         if (!setting) {
-//             setting = await Setting.create({
-//                 key: 'frequency_seconds',
-//                 value: Number(process.env.DEFAULT_FREQUENCY_SECONDS || 60)
-//             });
-//         }
-
-//         const freq = Number(setting.value);
-
-//         const jobFn = async () => {
-//             // console.log('Scheduler trigger: running detections for all labs...');
-//             console.log('Scheduler trigger: running detections for specific lab...');
-
-//             const lab = await Lab.findOne({name: LabId});
-//              if (!lab) {
-//             console.error(`Lab with ID ${LabId} not found`);
-//             return;
-//     }
-//             // await detectionService.runDetectionForAllLabs();
-//             await runDetectionForLab(lab);
-//         };
-
-//         try {
-//             scheduleDetection(freq, jobFn);
-//             console.log(`Scheduled detection every ${freq} seconds (or minutes if divisible by 60).`);
-//         } catch (err) {
-//             console.error('Could not schedule job:', err.message);
-//         }
-//     });
-// };
-
-// startServer();

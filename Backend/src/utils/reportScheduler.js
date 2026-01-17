@@ -1,18 +1,19 @@
 // runScheduler.js
+// src/runScheduler.js
 import cron from 'node-cron';
 import { DateTime } from 'luxon';
-import { generateAndSaveReport } from '../utils/reportGenerator.js';
+import { generateAndSaveReport } from './reportGenerator.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const cronExpr = process.env.REPORT_DAILY_CRON || '0 17 * * *'; // default: 17:00
+const cronExpr = process.env.REPORT_DAILY_CRON || '0 17 * * *'; // default 17:00
 const cronTZ = process.env.REPORT_DAILY_CRON_TZ || 'Asia/Kolkata';
 
 const runScheduler = () => {
   console.log('Report scheduler starting with cron:', cronExpr, 'tz:', cronTZ);
   cron.schedule(cronExpr, async () => {
     try {
-      // reportDate = today in Asia/Kolkata
+      // reportDate = today in cronTZ
       const reportDate = DateTime.now().setZone(cronTZ).toJSDate();
       console.log(`[Scheduler] Generating automatic "all labs" report for ${reportDate} (${cronTZ})`);
       await generateAndSaveReport({ mode: 'all', reportDate });

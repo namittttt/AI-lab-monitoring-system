@@ -4,100 +4,69 @@ import {ApiError} from "../utils/ApiError.js";
 import User from "../models/User.model.js";
 import jwt from "jsonwebtoken"
 
-export const  signup = asyncHandler( async(req,res)=>{
-    const {email,password,fullName}= req.body
+// ✅ Helper: Generate JWT
+const generateToken = (userId) =>
+  jwt.sign({ userId }, process.env.JWT_SECRET_KEY, { expiresIn: "7d" });
 
-        if(
-            [email,password,fullName].some((field)=>field?.trim() === "")
-        ){
-            throw new ApiError(400,"All fields are required");
-        }
+// ✅ Signup
+export const signup = asyncHandler(async (req, res) => {
+  const { email, password, fullName } = req.body;
+  if (!email || !password || !fullName)
+    throw new ApiError(400, "All fields are required");
 
-        if(password.length < 6){
-            throw new ApiError(400,"Password must be at leat 6 characters");
-        }
+  if (password.length < 6)
+    throw new ApiError(400, "Password must be at least 6 characters");
 
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) throw new ApiError(400, "Invalid email format");
 
-        if (!emailRegex.test(email)) {
-        return res.status(400).json({ message: "Invalid email format" });
-        }
+  const existing = await User.findOne({ email });
+  if (existing) throw new ApiError(400, "Email already registered");
 
-        const existingUser = await User.findOne({email});
-        if(existingUser){
-            throw new ApiError(400,"User with email already exists, Please use a different one")
-        }
+  const newUser = await User.create({ email, password, fullName });
+  const token = generateToken(newUser._id);
 
-        const newUser = await User.create({
-            email,
-            fullName,
-            password,
-        })
+  res.cookie("jwt", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
-        
-        const token = jwt.sign({userId:newUser._id},process.env.JWT_SECRET_KEY,{
-            expiresIn:"7d"
-        });
+  return res.status(201).json(
+    new ApiResponse(201, {
+      user: { _id: newUser._id, fullName, email },
+    }, "Signup successful")
+  );
+});
 
-        res.cookie("jwt",token,{
-            maxAge:7 * 24 * 60 * 60 * 1000,
-            httpOnly:true, //prevent XSS attacks
-            sameSite: "strict",//prevent CSRF attacks
-            secure:process.env.NODE_ENV === "production",
-            // secure: false
-        })
+// ✅ Login
+export const login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) throw new ApiError(400, "All fields required");
 
-        return res.status(201).json(
-        new ApiResponse(200,newUser,"User Registered Successfully")
-        )
+  const user = await User.findOne({ email });
+  if (!user || !(await user.matchPassword(password)))
+    throw new ApiError(401, "Invalid email or password");
 
-})
+  const token = generateToken(user._id);
 
+  res.cookie("jwt", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
-export const login = asyncHandler(async (req,res) => {
-    const { email,password} = req.body;
+  return res.status(200).json(
+    new ApiResponse(200, {
+      user: { _id: user._id, fullName: user.fullName, email: user.email },
+    }, "Login successful")
+  );
+});
 
-    if(
-        !email || !password
-        // [email,password].some((field)=>field?.trim() === "")
-    ){
-        throw new ApiError(400,"All fields are required");
-    }
-
-    const user = await User.findOne({email});
-    if(!user){
-        throw new ApiError(401,"Invalid Email or Password")
-    }
-
-    const isPasswordCorrect =await user.matchPassword(password)
-
-    if(!isPasswordCorrect){
-        throw new ApiError(401,"Invalid email or password");
-    }
-
-    const token = jwt.sign({userId:user._id},process.env.JWT_SECRET_KEY,{
-            expiresIn:"7d"
-        });
-
-        res.cookie("jwt",token,{
-            maxAge:7 * 24 * 60 * 60 * 1000,
-            httpOnly:true, //prevent XSS attacks
-            sameSite: "strict",//prevent CSRF attacks
-            secure:process.env.NODE_ENV === "production",
-        });
-
-        return res
-        .status(200)
-        .json(
-            new ApiResponse(200,user,"User Logged in successfully")
-        )
-})
-
-export const logout = asyncHandler(async (req,res) => {
-    res.clearCookie("jwt")
-    res
-    .status(200)
-    .json(
-        new ApiResponse(200,"Loged Out Successfully")
-    )
-})
+// ✅ Logout
+export const logout = asyncHandler(async (req, res) => {
+  res.clearCookie("jwt");
+  res.status(200).json(new ApiResponse(200, null, "Logged out successfully"));
+});

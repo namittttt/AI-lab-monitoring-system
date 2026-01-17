@@ -20,6 +20,7 @@
     "cloudinary": "^2.7.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
+    "date-fns": "^4.1.0",
     "dotenv": "^17.2.1",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
@@ -31,7 +32,9 @@
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "pdfkit": "^0.17.2",
-    "socket.io": "^4.8.1"
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "util": "^0.12.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

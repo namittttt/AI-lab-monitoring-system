@@ -1,3 +1,253 @@
+// import ExcelJS from 'exceljs';
+// import cron from 'node-cron';
+// import moment from 'moment-timezone';
+// import fs from 'fs';
+
+// import Lab from '../models/Lab.model.js';
+// import LabSession from '../models/LabSession.model.js';
+// import { startSessionDetections, stopSessionDetections } from '../utils/scheduler.js';
+
+// const cronRegistry = {
+//   startJobs: new Map(),
+//   stopJobs: new Map(),
+// };
+
+// const DAYNAME_TO_CRON_NUM = {
+//   sun: 0, sunday: 0,
+//   mon: 1, monday: 1,
+//   tue: 2, tuesday: 2,
+//   wed: 3, wednesday: 3,
+//   thu: 4, thursday: 4,
+//   fri: 5, friday: 5,
+//   sat: 6, saturday: 6,
+// };
+
+// function toCronNumber(dayName) {
+//   if (!dayName) return null;
+//   const key = String(dayName).trim().toLowerCase();
+//   return Object.prototype.hasOwnProperty.call(DAYNAME_TO_CRON_NUM, key)
+//     ? DAYNAME_TO_CRON_NUM[key]
+//     : null;
+// }
+
+// // ✅ Normalize header names
+// function normalizeHeader(header) {
+//   const h = String(header || '').trim().toLowerCase();
+//   switch (h) {
+//     case 'dayofweek': return 'DayOfWeek';
+//     case 'phonedetection':
+//     case 'ponedetection':
+//     case 'phonedetect': return 'PhoneDetection';
+//     case 'labname': return 'LabName';
+//     case 'starttime': return 'StartTime';
+//     case 'endtime': return 'EndTime';
+//     case 'detections': return 'Detections';
+//     default: return header;
+//   }
+// }
+
+// // ✅ Parse Excel time values into moment (IST)
+// function parseTimeStringToMomentOnNext(dayOfWeek, timeVal) {
+//   const tz = 'Asia/Kolkata';
+//   const now = moment.tz(tz);
+//   let hours, minutes;
+
+//   if (timeVal instanceof Date) {
+//     const d = moment(timeVal).tz(tz);
+//     hours = d.hours();
+//     minutes = d.minutes();
+//   } else if (typeof timeVal === 'number') {
+//     const totalMinutes = Math.round(timeVal * 24 * 60);
+//     hours = Math.floor(totalMinutes / 60) % 24;
+//     minutes = totalMinutes % 60;
+//   } else {
+//     const formats = [
+//       'h:mmA', 'hh:mmA', 'h:mm:ssA', 'hh:mm:ssA',
+//       'h:mm A', 'hh:mm A', 'h:mm:ss A', 'hh:mm:ss A',
+//       'H:mm', 'HH:mm', 'HH:mm:ss'
+//     ];
+//     const parsed = moment.tz(String(timeVal).trim(), formats, true, tz);
+//     if (!parsed.isValid()) throw new Error(`Invalid time string: ${timeVal}`);
+//     hours = parsed.hours();
+//     minutes = parsed.minutes();
+//   }
+
+//   const targetDowNum = toCronNumber(dayOfWeek);
+//   if (targetDowNum === null) throw new Error(`Invalid dayOfWeek: ${dayOfWeek}`);
+
+//   let candidate = now.clone().startOf('day');
+//   while (candidate.day() !== targetDowNum) candidate.add(1, 'day');
+
+//   candidate.hour(hours).minute(minutes).second(0).millisecond(0);
+//   if (candidate.isBefore(now)) candidate.add(7, 'days');
+
+//   return candidate;
+// }
+
+// // ✅ Enhanced clear-all function
+// async function clearExcelScheduledSessions() {
+//   console.log('[ExcelScheduler] Clearing all previously scheduled sessions...');
+
+//   // Stop and destroy all cron jobs
+//   for (const [id, task] of cronRegistry.startJobs.entries()) {
+//     try { task.stop(); task.destroy(); } catch {}
+//   }
+//   for (const [id, task] of cronRegistry.stopJobs.entries()) {
+//     try { task.stop(); task.destroy(); } catch {}
+//   }
+
+//   cronRegistry.startJobs.clear();
+//   cronRegistry.stopJobs.clear();
+//   console.log('[ExcelScheduler] Cron registry completely cleared.');
+
+//   try {
+//     const sessions = await LabSession.find({ createdFromExcel: true }).select('_id');
+//     for (const s of sessions) {
+//       try { await stopSessionDetections(s._id.toString()); } catch {}
+//     }
+
+//     await LabSession.deleteMany({ createdFromExcel: true });
+//     console.log('[ExcelScheduler] Old Excel-created sessions removed from DB.');
+//   } catch (e) {
+//     console.warn('[ExcelScheduler] Failed to stop old sessions:', e.message || e);
+//   }
+// }
+
+// // ✅ Schedule start & stop cron jobs
+// function scheduleCronForSession(sessionDoc) {
+//   if (!sessionDoc) return;
+//   const tz = 'Asia/Kolkata';
+//   const dayName = sessionDoc.recurrence?.dayOfWeek;
+//   const cronDayNum = toCronNumber(dayName);
+//   if (cronDayNum === null) {
+//     console.warn('Invalid dayOfWeek for session:', sessionDoc._id, dayName);
+//     return;
+//   }
+
+//   const startMoment = moment(sessionDoc.startTime).tz(tz);
+//   const endMoment = moment(sessionDoc.endTime).tz(tz);
+
+//   if (!startMoment.isValid() || !endMoment.isValid()) {
+//     console.warn('Invalid start/end Date fields for session', sessionDoc._id);
+//     return;
+//   }
+
+//   const startCronExpr = `${startMoment.minute()} ${startMoment.hour()} * * ${cronDayNum}`;
+//   const endCronExpr = `${endMoment.minute()} ${endMoment.hour()} * * ${cronDayNum}`;
+
+//   const startTask = cron.schedule(startCronExpr, async () => {
+//     console.log(`[ExcelScheduler] [START] session ${sessionDoc._id} lab=${sessionDoc.labName}`);
+//     try { await startSessionDetections(sessionDoc._id.toString()); } catch (e) {
+//       console.error('[ExcelScheduler] startSessionDetections error:', e);
+//     }
+//   }, { timezone: tz });
+
+//   const stopTask = cron.schedule(endCronExpr, async () => {
+//     console.log(`[ExcelScheduler] [STOP] session ${sessionDoc._id} lab=${sessionDoc.labName}`);
+//     try { await stopSessionDetections(sessionDoc._id.toString()); } catch (e) {
+//       console.error('[ExcelScheduler] stopSessionDetections error:', e);
+//     }
+//   }, { timezone: tz });
+
+//   cronRegistry.startJobs.set(sessionDoc._id.toString(), startTask);
+//   cronRegistry.stopJobs.set(sessionDoc._id.toString(), stopTask);
+
+//   console.log(`[ExcelScheduler] Scheduled weekly cron start: "${startCronExpr}" stop: "${endCronExpr}" for sessionId=${sessionDoc._id}`);
+// }
+
+// // ✅ Sync from Excel and reschedule
+// export async function syncSessionsFromExcel(source) {
+//   const workbook = new ExcelJS.Workbook();
+//   if (Buffer.isBuffer(source)) await workbook.xlsx.load(source);
+//   else if (typeof source === 'string' && fs.existsSync(source)) await workbook.xlsx.readFile(source);
+//   else throw new Error('syncSessionsFromExcel: invalid source');
+
+//   const sheet = workbook.worksheets[0];
+//   if (!sheet) throw new Error('No worksheet found in Excel file');
+
+//   const headerRow = sheet.getRow(1);
+//   const headers = headerRow.values.map(normalizeHeader);
+
+//   await clearExcelScheduledSessions();
+//   const processedSessions = [];
+
+//   for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber++) {
+//     const row = sheet.getRow(rowNumber);
+//     const values = row.values;
+//     const rowObj = {};
+
+//     headers.forEach((key, idx) => {
+//       if (!key) return;
+//       const val = values[idx] !== undefined ? values[idx] : '';
+//       rowObj[key] = (val && val.text) ? val.text : val;
+//     });
+
+//     const labName = rowObj.LabName;
+//     const dayOfWeek = rowObj.DayOfWeek;
+//     const startTimeVal = rowObj.StartTime;
+//     const endTimeVal = rowObj.EndTime;
+//     const detections = rowObj.Detections;
+//     const phoneDetectionRaw = rowObj.PhoneDetection;
+
+//     if (!labName || !dayOfWeek || !startTimeVal || !endTimeVal) {
+//       console.warn(`[ExcelScheduler] Skipping row ${rowNumber} - missing required columns`);
+//       continue;
+//     }
+
+//     const labNameStr = String(labName).trim();
+//     const dayStr = String(dayOfWeek).trim();
+//     const numDetections = Number(detections) || 1;
+//     const enablePhoneDetection = /^true$/i.test(String(phoneDetectionRaw).trim());
+
+//     let lab = await Lab.findOne({ name: labNameStr });
+//     if (!lab) {
+//       lab = await Lab.create({ name: labNameStr, cameraIP: '0' });
+//       console.log(`[ExcelScheduler] Created Lab "${labNameStr}" _id=${lab._id}`);
+//     }
+
+//     const startMomentIST = parseTimeStringToMomentOnNext(dayStr, startTimeVal);
+//     const endMomentIST = parseTimeStringToMomentOnNext(dayStr, endTimeVal);
+//     if (endMomentIST.isSameOrBefore(startMomentIST)) endMomentIST.add(1, 'day');
+
+//     const startUtc = startMomentIST.clone().utc().toDate();
+//     const endUtc = endMomentIST.clone().utc().toDate();
+
+//     const newSession = await LabSession.create({
+//       lab: lab._id,
+//       labName: lab.name,
+//       startTime: startUtc,
+//       endTime: endUtc,
+//       numberOfDetections: numDetections,
+//       enablePhoneDetection,
+//       createdFromExcel: true,
+//       recurrence: { dayOfWeek: dayStr, startTimeStr: startTimeVal, endTimeStr: endTimeVal },
+//     });
+
+//     console.log(`[ExcelScheduler] Created session ${newSession._id} for lab ${lab.name} start(IST)=${startMomentIST.format()} end(IST)=${endMomentIST.format()}`);
+
+//     scheduleCronForSession(newSession);
+//     processedSessions.push(newSession);
+//   }
+
+//   return { createdSessions: processedSessions.length };
+// }
+
+// export async function stopAllExcelScheduledSessions() {
+//   await clearExcelScheduledSessions();
+//   console.log('[ExcelScheduler] All excel scheduled sessions cleared.');
+// }
+
+// export default {
+//   syncSessionsFromExcel,
+//   stopAllExcelScheduledSessions,
+//   cronRegistry,
+// };
+
+
+
+
+
+
 // Backend/src/utils/excelScheduler.js
 import ExcelJS from 'exceljs';
 import cron from 'node-cron';
@@ -118,28 +368,69 @@ function parseTimeStringToMomentOnNext(dayOfWeek, timeVal) {
 /**
  * Clear all sessions created from Excel and stop their cron jobs.
  */
-async function clearExcelScheduledSessions() {
-  for (const [, task] of cronRegistry.startJobs.entries()) {
-    try { task.stop(); } catch {}
-  }
-  for (const [, task] of cronRegistry.stopJobs.entries()) {
-    try { task.stop(); } catch {}
-  }
-  cronRegistry.startJobs.clear();
-  cronRegistry.stopJobs.clear();
+// async function clearExcelScheduledSessions() {
+//   for (const [, task] of cronRegistry.startJobs.entries()) {
+//     try { task.stop(); } catch {}
+//   }
+//   for (const [, task] of cronRegistry.stopJobs.entries()) {
+//     try { task.stop(); } catch {}
+//   }
+//   cronRegistry.startJobs.clear();
+//   cronRegistry.stopJobs.clear();
 
-  try {
-    const sessions = await LabSession.find({ createdFromExcel: true }).select('_id');
-    for (const s of sessions) {
-      try { await stopSessionDetections(s._id.toString()); } catch {}
-    }
-  } catch (e) {
-    console.warn('Failed to stop active workers during clear:', e.message || e);
-  }
+//   try {
+//     const sessions = await LabSession.find({ createdFromExcel: true }).select('_id');
+//     for (const s of sessions) {
+//       try { await stopSessionDetections(s._id.toString()); } catch {}
+//     }
+//   } catch (e) {
+//     console.warn('Failed to stop active workers during clear:', e.message || e);
+//   }
 
-  await LabSession.deleteMany({ createdFromExcel: true });
-}
+//   await LabSession.deleteMany({ createdFromExcel: true });
+// }
+      async function clearExcelScheduledSessions() {
+        console.log('[ExcelScheduler] Clearing all Excel-based cron jobs (without deleting sessions)...');
 
+        // Stop all start jobs
+        for (const [sessionId, task] of cronRegistry.startJobs.entries()) {
+          try {
+            task.stop();
+            console.log(`[ExcelScheduler] Stopped start job for session ${sessionId}`);
+          } catch (e) {
+            console.warn(`[ExcelScheduler] Failed to stop start job for session ${sessionId}:`, e.message);
+          }
+        }
+
+        // Stop all stop jobs
+        for (const [sessionId, task] of cronRegistry.stopJobs.entries()) {
+          try {
+            task.stop();
+            console.log(`[ExcelScheduler] Stopped stop job for session ${sessionId}`);
+          } catch (e) {
+            console.warn(`[ExcelScheduler] Failed to stop stop job for session ${sessionId}:`, e.message);
+          }
+        }
+
+        cronRegistry.startJobs.clear();
+        cronRegistry.stopJobs.clear();
+
+        try {
+          const excelSessions = await LabSession.find({ createdFromExcel: true }).select('_id');
+          for (const s of excelSessions) {
+            try {
+              await stopSessionDetections(s._id.toString());
+            } catch (err) {
+              console.warn(`[ExcelScheduler] stopSessionDetections failed for ${s._id}:`, err.message);
+            }
+          }
+        } catch (e) {
+          console.warn('[ExcelScheduler] Failed to stop active workers during clear:', e.message || e);
+        }
+
+        // ⚠️ No deletion of sessions here anymore
+        console.log('[ExcelScheduler] All Excel-based cron jobs stopped, sessions preserved.');
+      }
 /**
  * Schedule cron jobs for a session (start + stop) using its stored UTC times.
  */

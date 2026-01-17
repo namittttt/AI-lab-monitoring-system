@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ✅ Remove default white background bleed */
+html,
+body,
+#root {
+  @apply m-0 p-0 min-h-screen;
+  background-color: #0f172a; /* slate-900 */
+  color-scheme: dark;
+}
+
+/* ✅ Default light theme (optional fallback) */
+body {
+  @apply text-slate-100 bg-slate-900;
+}
+
+/* ✅ When dark mode is active */
+.dark body {
+  @apply text-slate-100 bg-slate-900;
+}

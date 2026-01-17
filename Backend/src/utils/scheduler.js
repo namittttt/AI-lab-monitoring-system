@@ -1,8 +1,10 @@
+
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import Lab from '../models/Lab.model.js';
 import LabSession from '../models/LabSession.model.js';
+import cron from 'node-cron';
 import Detection from '../models/detection.model.js';
 import { uploadScreenshot } from './cloudinary.js';
 import { getIo } from '../utils/socket.js'; // update path as per your project
@@ -141,6 +143,100 @@ async function broadcastOccupancy(lab, peopleCount) {
   );
 }
 
+// async function persistDetection(lab, sessionId, json) {
+//   try {
+//     const activeSession = await LabSession.findById(sessionId);
+//     if (!activeSession) return;
+
+//     let doc = await Detection.findOne({ lab: lab._id, labSession: activeSession._id });
+//     if (!doc) {
+//       doc = await Detection.create({
+//         lab: lab._id,
+//         labSession: activeSession._id,
+//         labName: lab.name,
+//         detections: [],
+//         detectionsCount: 0
+//       });
+//     }
+
+//     const detectedObjects = Array.isArray(json.detectedObjects) && json.detectedObjects.length
+//       ? json.detectedObjects.filter(o => typeof o.count === 'number')
+//       : (typeof json.count === 'number' ? [{ label: 'person', count: json.count }] : []);
+
+//     const peopleObj = detectedObjects.find(o => o.label?.toLowerCase?.() === 'person');
+//     const peopleCount = peopleObj ? peopleObj.count : 0;
+
+//     // ✅ NEW: group screenshots under lab + session folders
+//     const sessionDir = path.resolve(process.cwd(), 'screenshots', lab.name, `session_${sessionId}`);
+//     fs.mkdirSync(sessionDir, { recursive: true });
+
+//     let cloudUrl = '';
+//     if (json.screenshot) {
+//       const candidatePath = path.isAbsolute(json.screenshot)
+//         ? json.screenshot
+//         : path.join(process.cwd(), json.screenshot);
+
+//       // ✅ Move screenshot to session folder
+//       const destPath = path.join(sessionDir, path.basename(candidatePath));
+//       try { fs.renameSync(candidatePath, destPath); } catch {}
+
+//       try {
+//         const uploadRes = await uploadScreenshot(destPath, {
+//           deleteLocal: true,
+//           folder: `lab_screenshots/${lab.name}/session_${sessionId}`
+//         });
+//         cloudUrl = uploadRes.url;
+//       } catch {
+//         if (fs.existsSync(destPath)) {
+//           cloudUrl = `/screenshots/${lab.name}/session_${sessionId}/${path.basename(destPath)}`;
+//         }
+//       }
+//     }
+
+//     const entryTimestamp = json.timestamp ? new Date(json.timestamp) : new Date();
+//     const detectionEntry = {
+//       timestamp: entryTimestamp,
+//       detectedObjects,
+//       imagePath: cloudUrl,
+//       sessionId: activeSession._id
+//     };
+
+//     await Detection.updateOne(
+//       { _id: doc._id },
+//       { $push: { detections: detectionEntry }, $inc: { detectionsCount: 1 } }
+//     );
+
+//     await LabSession.updateOne(
+//       { _id: activeSession._id },
+//       { $set: { lastDetectionAt: entryTimestamp }, $inc: { detectionsCount: 1 } }
+//     );
+
+//     await broadcastOccupancy(lab, peopleCount);
+
+//     getIo().emit('detection', {
+//       labId: lab._id,
+//       labName: lab.name,
+//       sessionId: activeSession._id,
+//       timestamp: entryTimestamp,
+//       detectedObjects,
+//       peopleCount,
+//       imageUrl: cloudUrl
+//     });
+
+//     if (json.phoneViolation === true && activeSession.enablePhoneDetection === true) {
+//       getIo().emit('phoneViolation', {
+//         labId: lab._id,
+//         labName: lab.name,
+//         sessionId: activeSession._id,
+//         timestamp: entryTimestamp
+//       });
+//     }
+//   } catch (err) {
+//     console.error('Error persisting detection:', err);
+//   }
+// }
+
+
 // Save detection in DB + broadcast occupancy
 async function persistDetection(lab, sessionId, json) {
   console.log(`[persistDetection] Called for sessionId=${sessionId}, lab=${lab.name}`);
@@ -236,6 +332,15 @@ async function persistDetection(lab, sessionId, json) {
         detectedObjects,
         peopleCount,
         imageUrl: cloudUrl
+      });
+
+      getIo().emit('liveDetection', {
+        labId: lab._id,
+        labName: lab.name,
+        imageUrl: `${cloudUrl}?t=${Date.now()}`,
+        peopleCount,
+        occupancyPercent: lab.capacity > 0 ? Math.min(100, (peopleCount / lab.capacity) * 100) : 0,
+        timestamp: new Date().toISOString()
       });
     } catch (e) {
       console.warn('Failed to emit detection via socket:', e);
@@ -444,30 +549,40 @@ export function getWorkerStateBySessionId(sessionId) {
   return controller ? controller.state : null;
 }
 
+/** ✅ NEW: daily cleanup at 00:00 (midnight) */
+// cron.schedule('0 0 * * *', () => {
+//   const root = path.resolve(process.cwd(), 'screenshots');
+//   console.log('🧹 Running midnight cleanup of local screenshots...');
+//   if (fs.existsSync(root)) {
+//     fs.readdirSync(root).forEach(labDir => {
+//       const full = path.join(root, labDir);
+//       deleteFolderRecursive(full);
+//     });
+//   }
+// });
 
 
 // import { spawn } from 'child_process';
 // import path from 'path';
 // import fs from 'fs';
+// import cron from 'node-cron';                // ✅ NEW (for midnight cleanup)
 // import Lab from '../models/Lab.model.js';
 // import LabSession from '../models/LabSession.model.js';
 // import Detection from '../models/detection.model.js';
+// import { uploadScreenshot } from './cloudinary.js';
+// import { getIo } from '../utils/socket.js'; // update path as per your project
 
-// const activeWorkers = new Map(); // sessionId -> { child, state, intervalId, startTimeoutId, runsDone }
+// const activeWorkers = new Map();
 
-// // Helper: safely parse JSON
 // function safeJsonParse(s) {
 //   try { return JSON.parse(s); } catch { return null; }
 // }
 
-// // Get path to python detection script — adjust if needed
 // function workerScriptPath() {
-//   // adapt to your repo layout; original used project root parent
 //   const projectRoot = path.resolve(process.cwd(), '..');
 //   return path.resolve(projectRoot, 'yolovenv', 'detect_students.py');
 // }
 
-// // Send command to worker with a sequence ID and wait for reply
 // export function sendCmd(state, obj, timeoutMs = 20000) {
 //   return new Promise((resolve, reject) => {
 //     if (!state || !state.child || state.child.killed) return reject(new Error('Worker not available'));
@@ -499,7 +614,6 @@ export function getWorkerStateBySessionId(sessionId) {
 //   });
 // }
 
-// // Spawn a new Python worker process and setup state and event handlers
 // function spawnWorker(lab, sessionId, saveDir) {
 //   const script = workerScriptPath();
 //   if (!fs.existsSync(script)) throw new Error(`Worker script not found at ${script}`);
@@ -568,21 +682,32 @@ export function getWorkerStateBySessionId(sessionId) {
 //   return state;
 // }
 
-// // Persist detection result in DB safely (and update LabSession)
+// /** Broadcast occupancy in real-time via Socket.IO */
+// async function broadcastOccupancy(lab, peopleCount) {
+//   const occupancyPercent = lab.capacity > 0
+//     ? Math.min(100, (peopleCount / lab.capacity) * 100)
+//     : 0;
+
+//   getIo().emit('labOccupancyUpdate', {
+//     labId: lab._id,
+//     labName: lab.name,
+//     peopleCount,
+//     occupancyPercent: Number(occupancyPercent.toFixed(2))
+//   });
+
+//   await Lab.updateOne(
+//     { _id: lab._id },
+//     { $set: { currentUtilization: occupancyPercent } }
+//   );
+// }
+
+// // Save detection in DB + broadcast occupancy
 // async function persistDetection(lab, sessionId, json) {
 //   try {
 //     const activeSession = await LabSession.findById(sessionId);
-//     if (!activeSession) {
-//       console.warn(`Session ${sessionId} not found when saving detection`);
-//       return;
-//     }
+//     if (!activeSession) return;
 
-//     // find or create top-level Detection doc for this labSession
-//     let doc = await Detection.findOne({
-//       lab: lab._id,
-//       labSession: activeSession._id
-//     });
-
+//     let doc = await Detection.findOne({ lab: lab._id, labSession: activeSession._id });
 //     if (!doc) {
 //       doc = await Detection.create({
 //         lab: lab._id,
@@ -593,443 +718,177 @@ export function getWorkerStateBySessionId(sessionId) {
 //       });
 //     }
 
-//     // build detectedObjects
 //     const detectedObjects = Array.isArray(json.detectedObjects) && json.detectedObjects.length
 //       ? json.detectedObjects.filter(o => typeof o.count === 'number')
 //       : (typeof json.count === 'number' ? [{ label: 'person', count: json.count }] : []);
 
-//     const imagePath = json.screenshot
-//       ? path.join('screenshots', lab.name, path.basename(json.screenshot))
-//       : '';
+//     const peopleObj = detectedObjects.find(o => o.label?.toLowerCase?.() === 'person');
+//     const peopleCount = peopleObj ? peopleObj.count : 0;
+
+//     // ✅ group screenshots under lab + session folders
+//     const sessionDir = path.resolve(process.cwd(), 'screenshots', lab.name, `session_${sessionId}`); // ✅ NEW
+//     fs.mkdirSync(sessionDir, { recursive: true }); // ✅ NEW
+
+//     let cloudUrl = '';
+//     if (json.screenshot) {
+//       const candidatePath = path.isAbsolute(json.screenshot)
+//         ? json.screenshot
+//         : path.join(process.cwd(), json.screenshot);
+
+//       // ✅ Move screenshot to session folder for grouping
+//       const destPath = path.join(sessionDir, path.basename(candidatePath));
+//       try { fs.renameSync(candidatePath, destPath); } catch {}
+//       try {
+//         const uploadRes = await uploadScreenshot(destPath, { deleteLocal: true, folder: `lab_screenshots/${lab.name}/session_${sessionId}` });
+//         cloudUrl = uploadRes.url;
+//       } catch {
+//         if (fs.existsSync(destPath)) {
+//           cloudUrl = `/screenshots/${lab.name}/session_${sessionId}/${path.basename(destPath)}`;
+//         }
+//       }
+//     }
 
 //     const entryTimestamp = json.timestamp ? new Date(json.timestamp) : new Date();
+//     const detectionEntry = {
+//       timestamp: entryTimestamp,
+//       detectedObjects,
+//       imagePath: cloudUrl,
+//       sessionId: activeSession._id
+//     };
 
-//     // push detection entry and increment per-Detection doc counter atomically
 //     await Detection.updateOne(
 //       { _id: doc._id },
-//       {
-//         $push: {
-//           detections: {
-//             timestamp: entryTimestamp,
-//             detectedObjects,
-//             imagePath,
-//             sessionId: activeSession._id
-//           }
-//         },
-//         $inc: { detectionsCount: 1 }
-//       }
+//       { $push: { detections: detectionEntry }, $inc: { detectionsCount: 1 } }
 //     );
 
-//     // Also update LabSession: lastDetectionAt and increment detectionsCount atomically
 //     await LabSession.updateOne(
 //       { _id: activeSession._id },
-//       {
-//         $set: { lastDetectionAt: entryTimestamp },
-//         $inc: { detectionsCount: 1 }
-//       }
+//       { $set: { lastDetectionAt: entryTimestamp }, $inc: { detectionsCount: 1 } }
 //     );
 
+//     await broadcastOccupancy(lab, peopleCount);
+
+//     getIo().emit('detection', {
+//       labId: lab._id,
+//       labName: lab.name,
+//       sessionId: activeSession._id,
+//       timestamp: entryTimestamp,
+//       detectedObjects,
+//       peopleCount,
+//       imageUrl: cloudUrl
+//     });
+
+//     if (json.phoneViolation === true && activeSession.enablePhoneDetection === true) {
+//       getIo().emit('phoneViolation', {
+//         labId: lab._id,
+//         labName: lab.name,
+//         sessionId: activeSession._id,
+//         timestamp: entryTimestamp
+//       });
+//     }
 //   } catch (err) {
 //     console.error('Error persisting detection:', err);
 //   }
 // }
 
-// // Start the session: spawn worker, schedule captures per interval
 // export async function startSessionDetections(sessionId) {
-//   if (activeWorkers.has(sessionId)) {
-//     console.log(`Session ${sessionId} already running`);
-//     return;
-//   }
-
+//   if (activeWorkers.has(sessionId)) return;
 //   const session = await LabSession.findById(sessionId);
-//   if (!session) {
-//     console.error(`Session ${sessionId} not found`);
-//     return;
-//   }
-
+//   if (!session) return;
 //   const lab = await Lab.findById(session.lab);
-//   if (!lab) {
-//     console.error(`Lab for session ${sessionId} not found`);
-//     return;
-//   }
+//   if (!lab) return;
 
 //   const start = new Date(session.startTime);
 //   const end = new Date(session.endTime);
 //   const runs = session.numberOfDetections || 1;
-
-//   if (!(end > start)) {
-//     console.error('Invalid session times');
-//     return;
-//   }
-
 //   const totalSeconds = (end - start) / 1000;
 //   const intervalSeconds = totalSeconds / runs;
 
-//   console.log(`Starting session ${sessionId} (lab ${lab.name}) start=${start} end=${end} runs=${runs} every=${intervalSeconds}s`);
-
-//   const saveDir = path.resolve(process.cwd(), 'screenshots', lab.name);
+//   const saveDir = path.resolve(process.cwd(), 'screenshots', lab.name, `session_${sessionId}`); // ✅ UPDATED
 //   fs.mkdirSync(saveDir, { recursive: true });
 
 //   const state = spawnWorker(lab, sessionId, saveDir);
-
 //   const controller = {
 //     child: state.child,
 //     state,
+//     lab,
+//     session,
 //     intervalId: null,
 //     startTimeoutId: null,
 //     runsDone: 0
 //   };
-
 //   activeWorkers.set(sessionId, controller);
 
 //   const doCapture = async () => {
 //     if (!activeWorkers.has(sessionId)) return;
 //     const now = new Date();
 //     if (now > end || controller.runsDone >= runs) {
-//       console.log(`Session ${sessionId} ended or runs completed`);
 //       await stopSessionDetections(sessionId);
 //       return;
 //     }
-//     if (state.isRunning) {
-//       console.log(`Previous capture still running for ${sessionId}, skipping`);
-//       return;
-//     }
+//     if (state.isRunning) return;
 //     state.isRunning = true;
 //     try {
-//       const cmd = { cmd: 'capture', timestamp: new Date().toISOString() };
+//       const cmd = {
+//         cmd: 'capture',
+//         timestamp: new Date().toISOString(),
+//         enablePhoneDetection: session.enablePhoneDetection
+//       };
 //       const resp = await sendCmd(state, cmd, Math.max(15000, intervalSeconds * 1000));
 //       await persistDetection(lab, sessionId, resp);
 //       controller.runsDone += 1;
-//       console.log(`Session ${sessionId} capture ${controller.runsDone}/${runs} done`);
 //     } catch (err) {
-//       console.error(`Capture error for ${sessionId}:`, err.message || err);
+//       console.error(`Capture error for ${sessionId}:`, err);
 //     } finally {
 //       state.isRunning = false;
 //     }
 //   };
 
-//   const now = new Date();
-//   console.log(`Current server time: ${now.toISOString()}`);
-//   console.log(`Session start time: ${start.toISOString()}, end time: ${end.toISOString()}`);
-//   if (start > now) {
-//     const delay = start - now;
-//     controller.startTimeoutId = setTimeout(async () => {
-//       controller.startTimeoutId = null;
-//       await doCapture();
-//       controller.intervalId = setInterval(doCapture, Math.max(1000, intervalSeconds * 1000));
+//   if (start > new Date()) {
+//     const delay = start - new Date();
+//     controller.startTimeoutId = setTimeout(() => {
+//       doCapture();
+//       controller.intervalId = setInterval(doCapture, intervalSeconds * 1000);
 //     }, delay);
-//     console.log(`Worker spawned. First capture scheduled in ${Math.round(delay/1000)}s`);
 //   } else {
-//     console.log('Session start time is in the past or now. Starting capture immediately.');
-//     await doCapture();
-//     controller.intervalId = setInterval(doCapture, Math.max(1000, intervalSeconds * 1000));
+//     doCapture();
+//     controller.intervalId = setInterval(doCapture, intervalSeconds * 1000);
 //   }
 // }
 
-// // Stop session and kill worker
+// function deleteFolderRecursive(folderPath) {
+//   if (fs.existsSync(folderPath)) {
+//     fs.readdirSync(folderPath).forEach(file => {
+//       const cur = path.join(folderPath, file);
+//       if (fs.lstatSync(cur).isDirectory()) deleteFolderRecursive(cur);
+//       else fs.unlinkSync(cur);
+//     });
+//     fs.rmdirSync(folderPath);
+//   }
+// }
+
 // export async function stopSessionDetections(sessionId) {
-//   if (!activeWorkers.has(sessionId)) {
-//     console.log(`No active worker for ${sessionId}`);
-//     return;
-//   }
+//   if (!activeWorkers.has(sessionId)) return;
 //   const controller = activeWorkers.get(sessionId);
-//   if (controller.startTimeoutId) {
-//     clearTimeout(controller.startTimeoutId);
-//     controller.startTimeoutId = null;
-//   }
-//   if (controller.intervalId) {
-//     clearInterval(controller.intervalId);
-//     controller.intervalId = null;
-//   }
+//   if (controller.startTimeoutId) clearTimeout(controller.startTimeoutId);
+//   if (controller.intervalId) clearInterval(controller.intervalId);
 
 //   const state = controller.state;
-//   try {
-//     if (state && state.child && !state.child.killed) {
-//       await sendCmd(state, { cmd: 'stop' }, 3000);
-//     }
-//   } catch {
-//     // ignore errors
-//   }
-
-//   setTimeout(() => {
-//     try {
-//       if (state && state.child && !state.child.killed) {
-//         state.child.kill('SIGTERM');
-//         console.log(`Force-killed worker for ${sessionId}`);
-//       }
-//     } catch (e) {
-//       console.error('Error force-killing worker:', e);
-//     }
-//   }, 2500);
-
-//   if (state && state.pending) {
-//     for (const [s, { reject, timeout }] of state.pending.entries()) {
-//       clearTimeout(timeout);
-//       reject(new Error('Session stopped'));
-//     }
-//     state.pending.clear();
-//   }
+//   try { if (state?.child && !state.child.killed) await sendCmd(state, { cmd: 'stop' }, 3000); } catch {}
+//   setTimeout(() => { try { state?.child?.kill('SIGTERM'); } catch {} }, 2500);
 
 //   activeWorkers.delete(sessionId);
 //   console.log(`Stopped detections for session ${sessionId}`);
 // }
 
-// export function stopAllDetections() {
-//   for (const id of Array.from(activeWorkers.keys())) {
-//     stopSessionDetections(id).catch(e => console.error(e));
-//   }
-// }
-
-// // Helper to get worker state by sessionId (for controller usage)
-// export function getWorkerStateBySessionId(sessionId) {
-//   const controller = activeWorkers.get(sessionId);
-//   return controller ? controller.state : null;
-// }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// import LabSession from '../models/LabSession.model.js';
-// import Lab from '../models/Lab.model.js';
-// import runDetectionForLab from "../controllers/detection.controller.js";
-
-// let activeTimers = new Map();     // sessionId -> timerId
-// let activeProcesses = new Map();  // sessionId -> Python child process
-
-// // Register a process so we can kill it later
-// function registerProcess(sessionId, process) {
-//   // Kill any old process for this session before replacing
-//   if (activeProcesses.has(sessionId)) {
-//     try {
-//       activeProcesses.get(sessionId).kill("SIGTERM");
-//       console.log(`Killed old process for ${sessionId}`);
-//     } catch (e) {
-//       console.error(`Error killing old process for ${sessionId}:`, e);
-//     }
-//   }
-//   activeProcesses.set(sessionId, process);
-// }
-
-// function unregisterProcess(sessionId) {
-//   activeProcesses.delete(sessionId);
-// }
-
-// async function startSessionDetections(sessionId) {
-//   const session = await LabSession.findById(sessionId);
-//   if (!session) {
-//     console.error(`Session ${sessionId} not found`);
-//     return;
-//   }
-
-//   const lab = await Lab.findById(session.lab);
-//   if (!lab) {
-//     console.error(`Lab not found for session ${sessionId}`);
-//     return;
-//   }
-
-//   const start = new Date(session.startTime);
-//   const end = new Date(session.endTime);
-//   const totalSeconds = (end - start) / 1000;
-//   const intervalSeconds = totalSeconds / session.numberOfDetections;
-
-//   console.log(`Starting detection for session ${sessionId} every ${intervalSeconds}s`);
-
-//   const timerId = setInterval(async () => {
-//     const now = new Date();
-//     if (now >= end) {
-//       console.log(`Session ${sessionId} ended, stopping detections`);
-//       stopSessionDetections(sessionId);
-//       return;
-//     }
-
-//     await runDetectionForLab(lab, {
-//       startTime: session.startTime,
-//       endTime: session.endTime,
-//       numberOfDetections: session.numberOfDetections,
-//       sessionId, // Pass sessionId so controller can register the process
-//       registerProcess // Pass in the process registration function
-//     }).catch(err => {
-//       console.error(`Error in detection for session ${sessionId}:`, err);
+// /** ✅ NEW: daily cleanup at 00:00 (midnight) */
+// cron.schedule('0 0 * * *', () => {
+//   const root = path.resolve(process.cwd(), 'screenshots');
+//   console.log('🧹 Running midnight cleanup of local screenshots...');
+//   if (fs.existsSync(root)) {
+//     fs.readdirSync(root).forEach(labDir => {
+//       const full = path.join(root, labDir);
+//       deleteFolderRecursive(full);
 //     });
-//   }, intervalSeconds * 1000);
-
-//   activeTimers.set(sessionId, timerId);
-// }
-
-// function stopSessionDetections(sessionId) {
-//   if (activeTimers.has(sessionId)) {
-//     clearInterval(activeTimers.get(sessionId));
-//     activeTimers.delete(sessionId);
-//     console.log(`Timer cleared for ${sessionId}`);
 //   }
-
-//   if (activeProcesses.has(sessionId)) {
-//     try {
-//       activeProcesses.get(sessionId).kill("SIGTERM");
-//       console.log(`Killed process for ${sessionId}`);
-//     } catch (e) {
-//       console.error(`Error killing process for ${sessionId}:`, e);
-//     }
-//     activeProcesses.delete(sessionId);
-//   }
-
-//   console.log(`Stopped detections for session ${sessionId}`);
-// }
-
-// function stopAllDetections() {
-//   for (const sessionId of [...activeTimers.keys(), ...activeProcesses.keys()]) {
-//     stopSessionDetections(sessionId);
-//   }
-// }
-
-// export {
-//   startSessionDetections,
-//   stopSessionDetections,
-//   stopAllDetections,
-//   registerProcess,
-//   unregisterProcess
-// };
-
-
-
-
-
-
-
-
-
-
-
-
-// import LabSession from '../models/LabSession.model.js';
-// import Lab from '../models/Lab.model.js';
-// import runDetectionForLab from "../controllers/detection.controller.js";
-
-// let activeTimers = new Map();     // sessionId -> timerId
-// let activeProcesses = new Map();  // sessionId -> Python child process
-
-// // Helper functions to register/unregister processes
-// function registerProcess(sessionId, process) {
-//   if (activeProcesses.has(sessionId)) {
-//     try {
-//       activeProcesses.get(sessionId).kill("SIGTERM");
-//     } catch (e) {
-//       console.error(`Error killing old process for ${sessionId}:`, e);
-//     }
-//   }
-//   activeProcesses.set(sessionId, process);
-// }
-
-// function unregisterProcess(sessionId) {
-//   activeProcesses.delete(sessionId);
-// }
-
-// async function startSessionDetections(sessionId) {
-//   const session = await LabSession.findById(sessionId);
-//   if (!session) {
-//     console.error(`Session ${sessionId} not found`);
-//     return;
-//   }
-
-//   const lab = await Lab.findById(session.lab);
-//   if (!lab) {
-//     console.error(`Lab not found for session ${sessionId}`);
-//     return;
-//   }
-
-//   const start = new Date(session.startTime);
-//   const end = new Date(session.endTime);
-//   const totalSeconds = (end - start) / 1000;
-//   const intervalSeconds = totalSeconds / session.numberOfDetections;
-
-//   console.log(`Starting detection for session ${sessionId} every ${intervalSeconds}s`);
-
-//   const timerId = setInterval(async () => {
-//     const now = new Date();
-//     if (now >= end) {
-//       console.log(`Session ${sessionId} ended, stopping detections`);
-//       stopSessionDetections(sessionId);
-//       return;
-//     }
-
-//     await runDetectionForLab(lab, {
-//       startTime: session.startTime,
-//       endTime: session.endTime,
-//       numberOfDetections: session.numberOfDetections,
-//       sessionId
-//     }).catch(err => {
-//       console.error(`Error in detection for session ${sessionId}:`, err);
-//     });
-//   }, intervalSeconds * 1000);
-
-//   activeTimers.set(sessionId, timerId);
-// }
-
-// function stopSessionDetections(sessionId) {
-//   if (activeTimers.has(sessionId)) {
-//     clearInterval(activeTimers.get(sessionId));
-//     activeTimers.delete(sessionId);
-//   }
-
-//   if (activeProcesses.has(sessionId)) {
-//     try {
-//       activeProcesses.get(sessionId).kill("SIGTERM");
-//     } catch (e) {
-//       console.error(`Error killing process for ${sessionId}:`, e);
-//     }
-//     activeProcesses.delete(sessionId);
-//   }
-
-//   console.log(`Stopped detections for session ${sessionId}`);
-// }
-
-// function stopAllDetections() {
-//   for (const sessionId of activeTimers.keys()) {
-//     stopSessionDetections(sessionId);
-//   }
-// }
-
-// export {
-//   startSessionDetections,
-//   stopSessionDetections,
-//   stopAllDetections,
-//   registerProcess,
-//   unregisterProcess
-// };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// });
