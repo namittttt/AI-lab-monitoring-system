@@ -1,4 +1,4 @@
-# AI Lab Monitoring System (OpenCV)
+# AI Powered Lab Monitoring System (OpenCV)
 
 An AI-powered lab monitoring system that uses **OpenCV** to **count students** from CCTV/video feed, generate **automated reports**, and support **timetable-based automation** for real-world lab management in colleges.
 
